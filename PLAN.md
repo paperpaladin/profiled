@@ -85,13 +85,27 @@ Ranked by how little we control them.
            and handing every signal back killed every tracee at exec.
            Also: strace -c is the wrong view, because it counts calls
            that returned and exit_group never does.
-- [ ] 04 the profile file: text, sorted, with the ABI named in it
+- [x] 04 the profile file: text, sorted, with the ABI named in it
       why: sorted so two recordings of the same workload produce the
            same bytes, and the ABI named so a profile cannot be
            loaded on a machine where the numbers mean something else.
-- [ ] 05 apply: install the filter, exec the program
+- [x] 05 apply: install the filter, exec the program
       why: the first half of the claim. Compared against the
            unconfined run byte for byte, not just by exit status.
+      done: and the byte-for-byte part earned itself immediately. The
+           suite recorded with stdout inherited and applied with
+           stdout to a file, and cat died under what looked like its
+           own profile: it uses copy_file_range to a regular file and
+           read/write to a pipe. A profile is a property of the
+           program AND the environment it ran in. That is now a test
+           which records one way, applies the other, and requires the
+           kill.
+           Also: the filter length was computed as 2 per syscall while
+           the code emits 1, so every jump offset was wrong and the
+           kernel said EINVAL without naming a cause. There is an
+           assertion that the emitted count matches the computed one.
+           Nine mutations across the reader and the filter, all
+           caught.
 - [ ] 06 check: prove the profile is tight
       why: the second half, and the one that is easy to fake. A
            syscall outside the profile has to be issued and the

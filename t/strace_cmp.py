@@ -72,7 +72,9 @@ def main():
     if r.returncode != 0:
         print("  record failed: %s" % r.stderr.decode().strip()[:160])
         return 1
-    ours = {int(x) for x in open(prof).read().split()}
+    # Skip the two header lines: the format is a magic line, an arch
+    # line, then one number per line.
+    ours = {int(x) for x in open(prof).read().split("\n")[2:] if x.strip()}
 
     # strace prints "syscall" for a number it has no name for, and the
     # header has no entry for that. Reported rather than dropped: it

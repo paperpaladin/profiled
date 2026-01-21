@@ -102,16 +102,20 @@ trap 'rm -rf "$TMP"' EXIT INT TERM
 "$PWD/profiled" record -o "$TMP/p" -- /bin/echo marker > "$TMP/out" 2>&1
 eq "the program's own output does not reach the profile" \
    "marker" "$(cat "$TMP/out")"
-if grep -qv '^[0-9][0-9]*$' "$TMP/p"; then
-	nok "the profile is numbers only" "$(grep -v '^[0-9][0-9]*$' "$TMP/p" | head -2 | tr '\n' ' ')"
+# A header naming the format and the ABI, then nothing but numbers.
+eq "the profile names its format" "profiled 1" "$(sed -n 1p "$TMP/p")"
+eq "the profile names its ABI" "arch 0xc000003e" "$(sed -n 2p "$TMP/p")"
+if tail -n +3 "$TMP/p" | grep -qv '^[0-9][0-9]*$'; then
+	nok "the rest of the profile is numbers only" \
+	    "$(tail -n +3 "$TMP/p" | grep -v '^[0-9][0-9]*$' | head -2 | tr '\n' ' ')"
 else
-	ok "the profile is numbers only"
+	ok "the rest of the profile is numbers only"
 fi
 
 # exit_group, 231, is the specific case the strace summary loses. Named
 # here so that a regression says which syscall rather than "the sets
 # differ".
-if grep -qx 231 "$TMP/p"; then
+if tail -n +3 "$TMP/p" | grep -qx 231; then
 	ok "exit_group is in the profile, which strace -c would have lost"
 else
 	nok "exit_group is in the profile" "231 is absent"
@@ -185,6 +189,115 @@ if command -v strace >/dev/null 2>&1; then
 	done
 else
 	echo "SKIP  strace is not installed, so the recorder has no second observer"
+fi
+
+# -------------------------------------------------------------- apply
+# The first half of the claim: under its own profile the program must
+# behave identically. Not "exits 0": stdout, stderr and exit status
+# compared byte for byte against the unconfined run, because a sandbox
+# that quietly breaks the workload is not a tighter sandbox.
+for w in "/bin/echo hello" "/bin/cat /etc/hostname" "/usr/bin/head -2 /etc/hosts"; do
+	# shellcheck disable=SC2086
+	set -- $w
+	"$@" > "$TMP/free.out" 2> "$TMP/free.err"; free_st=$?
+	# Recorded with its output going to the same kind of place as the
+	# runs it is compared against. That is not a tidiness point: cat
+	# uses copy_file_range to a regular file and a read/write loop to
+	# a pipe, so recording with stdout elsewhere produces a profile
+	# that kills it here. See the case below, which demonstrates it.
+	if ! "$PWD/profiled" record -o "$TMP/p" -- "$@" \
+	     > "$TMP/rec.out" 2> "$TMP/rec.err"; then
+		nok "record [$w]" "$(head -1 "$TMP/rec.err")"
+		continue
+	fi
+	"$PWD/profiled" apply "$TMP/p" -- "$@" > "$TMP/jail.out" 2> "$TMP/jail.err"
+	jail_st=$?
+	if [ "$free_st" != "$jail_st" ]; then
+		nok "[$w] runs identically under its own profile" \
+		    "exit $free_st free, $jail_st confined: $(head -1 "$TMP/jail.err")"
+	elif ! cmp -s "$TMP/free.out" "$TMP/jail.out"; then
+		nok "[$w] runs identically under its own profile" "stdout differs"
+	elif ! cmp -s "$TMP/free.err" "$TMP/jail.err"; then
+		nok "[$w] runs identically under its own profile" "stderr differs"
+	else
+		ok "[$w] runs identically under its own profile"
+	fi
+done
+
+# A profile from one program applied to another has to kill it. This is
+# not the tightness check, which comes next and is sharper, but it is
+# the cheap version of it: if this passed by allowing everything, the
+# whole project would be decoration.
+"$PWD/profiled" record -o "$TMP/echo.p" -- /bin/echo hi > /dev/null 2>&1
+got=$(./t/waitstat -q "$PWD/profiled" apply "$TMP/echo.p" -- /bin/cat /etc/hostname 2>/dev/null)
+eq "another program under that profile is killed" "signal 31" "$got"
+
+# The coverage problem, in its least obvious form. A profile is not a
+# property of the program: it is a property of the program AND the
+# environment it ran in. cat writes to a regular file with
+# copy_file_range and to a pipe with read and write, so the same
+# command line produces two different syscall sets depending on where
+# stdout points, and a profile from one kills it under the other.
+#
+# This is demonstrated rather than worked around, because it is the
+# thing a user of this program most needs to know.
+"$PWD/profiled" record -o "$TMP/pipe.p" -- /bin/cat /etc/hostname \
+	> /dev/null 2>&1
+got=$(./t/waitstat "$PWD/profiled" apply "$TMP/pipe.p" -- \
+      /bin/cat /etc/hostname > "$TMP/cfr.out" 2>/dev/null)
+if [ "$got" = "signal 31" ]; then
+	ok "a profile recorded with stdout elsewhere kills the same command"
+else
+	# Not a failure of the program: it means this cat no longer takes
+	# a different path, and the warning in the README needs a new
+	# example rather than deleting.
+	printf 'SKIP  cat no longer varies by output type here (got %s)\n' "$got"
+fi
+
+# ----------------------------------------------- the profile is read strictly
+# Every line is understood or refused. A reader that skips what it does
+# not recognise turns a typo into a policy permitting less than the
+# file says, and the program then dies somewhere else with no hint that
+# the file was the problem.
+refuses() { # name, how to build the bad file, expected substring
+	eval "$2"
+	out=$("$PWD/profiled" apply "$TMP/bad" -- /bin/true 2>&1)
+	if [ $? -eq 0 ]; then
+		nok "refuses $1" "it was accepted"
+	elif printf '%s' "$out" | grep -q "$3"; then
+		ok "refuses $1, by name"
+	else
+		nok "refuses $1" "message did not mention $3: $out"
+	fi
+}
+refuses "a file that is not a profile" \
+	'printf "hello\n1\n" > "$TMP/bad"' "not a version 1 profile"
+refuses "a profile for another architecture" \
+	'sed "s/^arch .*/arch 0x40000028/" "$TMP/echo.p" > "$TMP/bad"' "arch"
+refuses "a profile with no arch line" \
+	'grep -v "^arch " "$TMP/echo.p" > "$TMP/bad"' "no arch line"
+refuses "an out-of-order profile" \
+	'{ head -2 "$TMP/echo.p"; echo 300; echo 10; } > "$TMP/bad"' "out of order"
+refuses "a repeated syscall" \
+	'{ head -2 "$TMP/echo.p"; echo 10; echo 10; } > "$TMP/bad"' "out of order or repeated"
+refuses "a line that is not a number" \
+	'{ head -2 "$TMP/echo.p"; echo "read"; } > "$TMP/bad"' "cannot read"
+refuses "a syscall number out of range" \
+	'{ head -2 "$TMP/echo.p"; echo 99999; } > "$TMP/bad"' "cannot read"
+refuses "an empty file" \
+	': > "$TMP/bad"' "not a profile"
+refuses "a profile permitting nothing" \
+	'head -2 "$TMP/echo.p" > "$TMP/bad"' "permits no syscalls"
+
+# Two recordings of the same workload must produce the same bytes, or
+# a profile cannot be reviewed in a diff.
+"$PWD/profiled" record -o "$TMP/a.p" -- /bin/echo hi > /dev/null 2>&1
+"$PWD/profiled" record -o "$TMP/b.p" -- /bin/echo hi > /dev/null 2>&1
+if cmp -s "$TMP/a.p" "$TMP/b.p"; then
+	ok "two recordings of the same workload are byte-identical"
+else
+	nok "two recordings of the same workload are byte-identical" \
+	    "$(diff "$TMP/a.p" "$TMP/b.p" | head -3 | tr '\n' ' ')"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
