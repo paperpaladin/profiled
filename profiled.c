@@ -4,8 +4,7 @@
 //
 // So far: the filter builder and the probe subcommand the suite drives
 // to show that an installed filter actually bites, `record`, the
-// profile file, and `apply`. `check` is next and is the half of the
-// claim that is easy to fake.
+// profile file, `apply`, and `check`.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
@@ -17,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -397,6 +397,91 @@ static int apply(const char *path, char **argv) {
   return 127;
 }
 
+// ---------------------------------------------------------------- check
+
+// Syscalls safe to issue in a process whose filter might be broken.
+//
+// That caveat is the whole reason this list exists rather than a loop
+// over all 1024 numbers. The point of the check is to confirm a
+// denied call is killed before it runs; if the filter is wrong, the
+// call runs. Issuing an arbitrary syscall under those conditions is
+// precisely the thing not to do, so every probe here is pure: it
+// reads a number the kernel already knows and changes nothing, with
+// no arguments to get wrong.
+static const struct { int nr; const char *name; } PROBES[] = {
+  {  24, "sched_yield" },
+  {  39, "getpid"      },
+  {  96, "gettimeofday"},
+  { 102, "getuid"      },
+  { 104, "getgid"      },
+  { 107, "geteuid"     },
+  { 108, "getegid"     },
+  { 110, "getppid"     },
+  { 186, "gettid"      },
+  { 201, "time"        },
+};
+#define PROBES_N ((int)(sizeof PROBES / sizeof *PROBES))
+
+// Runs one probe in a child under the filter. Returns 1 if the kernel
+// killed it with SIGSYS, 0 if the call returned, -1 if something else
+// happened and the result cannot be read.
+static int probe_under(const unsigned char *set, int n, int nr) {
+  fflush(NULL);
+  pid_t pid = fork();
+  if (pid < 0) { perror("profiled: fork"); return -1; }
+  if (pid == 0) {
+    struct rlimit no_core = { 0, 0 };
+    setrlimit(RLIMIT_CORE, &no_core);
+    if (install_allow(set, n) < 0) _exit(2);
+    syscall(nr);
+    _exit(0);
+  }
+  int st;
+  if (waitpid(pid, &st, 0) < 0) { perror("profiled: waitpid"); return -1; }
+  if (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) return 1;
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) return 0;
+  return -1;
+}
+
+static int check(const char *path) {
+  static unsigned char set[NR_MAX];
+  int n = read_profile(path, set);
+  if (n < 0) return 2;
+
+  int denied = 0, permitted = 0, bad = 0;
+  for (int i = 0; i < PROBES_N; i++) {
+    int nr = PROBES[i].nr;
+    int want_kill = !set[nr];
+    int got = probe_under(set, n, nr);
+    if (got < 0) {
+      printf("  %-13s could not be read\n", PROBES[i].name);
+      bad++;
+    } else if (got != want_kill) {
+      printf("  %-13s %s, and the profile says it should %s\n",
+             PROBES[i].name,
+             got ? "was killed" : "returned",
+             want_kill ? "be denied" : "be permitted");
+      bad++;
+    } else if (want_kill) {
+      denied++;
+    } else {
+      permitted++;
+    }
+  }
+
+  // A check that happened to probe only permitted syscalls would
+  // report success having tested nothing about denial, which is the
+  // half of the claim that matters. It refuses instead.
+  if (!denied && !bad) {
+    fprintf(stderr, "profiled: every probe is permitted by this profile, so "
+            "nothing about denial was tested\n");
+    return 2;
+  }
+  printf("check: %d denied as expected, %d permitted as expected, %d wrong\n",
+         denied, permitted, bad);
+  return bad ? 1 : 0;
+}
+
 static void usage(void) {
   fputs("usage: profiled probe DENY_NR CALL_NR\n"
         "  installs a filter killing DENY_NR, then makes syscall CALL_NR.\n"
@@ -405,7 +490,9 @@ static void usage(void) {
         "  writes the syscall numbers CMD made to FILE, one per line,\n"
         "  sorted. Never to stdout: the traced program has that one.\n"
         "usage: profiled apply FILE -- CMD [ARG...]\n"
-        "  installs FILE as a seccomp policy, then runs CMD under it.\n",
+        "  installs FILE as a seccomp policy, then runs CMD under it.\n"
+        "usage: profiled check FILE\n"
+        "  issues syscalls FILE omits and requires the kernel to kill.\n",
         stderr);
 }
 
@@ -438,6 +525,7 @@ int main(int argc, char **argv) {
     if (i >= argc) { usage(); return 2; }
     return apply(argv[2], argv + i);
   }
+  if (argc == 3 && !strcmp(argv[1], "check")) return check(argv[2]);
   usage();
   return 2;
 }

@@ -254,6 +254,83 @@ else
 	printf 'SKIP  cat no longer varies by output type here (got %s)\n' "$got"
 fi
 
+# -------------------------------------------------------------- check
+# The second half, and the one that is easy to fake. A profile is
+# tight only if a syscall it omits is actually killed, and nothing so
+# far has asked for that directly: "another program is killed" is
+# suggestive, not a measurement of this profile.
+#
+# The probes are pure syscalls, and the reason is the check itself. It
+# confirms a denied call is stopped before it runs; if the filter is
+# wrong, the call runs. Issuing an arbitrary syscall in a process
+# whose filter might be broken is precisely the thing not to do.
+out=$("$PWD/profiled" check "$TMP/echo.p" 2>&1)
+if [ $? -eq 0 ] && printf '%s' "$out" | grep -q '0 wrong'; then
+	ok "check: $(printf '%s' "$out" | tail -1 | sed 's/^check: //')"
+else
+	nok "check reports the profile is tight"
+	printf '%s\n' "$out" | head -5 | sed 's/^/        /'
+fi
+
+# Both directions in one profile: permitted probes must return and
+# omitted ones must die. A check that only ever saw one side would
+# pass with a filter that killed everything.
+{ head -2 "$TMP/echo.p"
+  { tail -n +3 "$TMP/echo.p"; echo 39; } | sort -n | uniq
+} > "$TMP/one.p"
+out=$("$PWD/profiled" check "$TMP/one.p" 2>&1)
+case "$out" in
+	*"9 denied as expected, 1 permitted as expected, 0 wrong"*)
+		ok "check sees both directions: getpid permitted, the rest denied" ;;
+	*) nok "check sees both directions" "$out" ;;
+esac
+
+# check tests install_allow, not the profile, so the two can only
+# disagree when the filter builder is wrong. Which means nothing in
+# this suite had ever seen check report a wrong answer: a mutation
+# making it always say "tight" passed everything.
+#
+# So the defect is planted. A copy of the source whose filter permits
+# one syscall the profile does not, built and run, and check has to
+# notice. Without this the tightness check is a function that has only
+# ever been asked easy questions.
+# The defect has to keep the instruction count the same, or the
+# assertion in install_allow catches it first and check never gets a
+# chance to be wrong. So it is a mis-aimed comparison rather than an
+# extra one: the filter permits getpid in place of write.
+sed 's/(unsigned)i, (unsigned char)to_allow/(unsigned)(i == 1 ? 39 : i), (unsigned char)to_allow/' \
+    profiled.c > "$TMP/leaky.c"
+if cmp -s profiled.c "$TMP/leaky.c"; then
+	nok "the planted leak was planted" "the sed matched nothing"
+else
+	cc -std=c11 -O1 -w -o "$TMP/leaky" "$TMP/leaky.c" || exit 1
+	out=$("$TMP/leaky" check "$TMP/echo.p" 2>&1)
+	if [ $? -eq 0 ]; then
+		nok "check notices a filter that permits more than the profile" \
+		    "it reported success: $(printf '%s' "$out" | tail -1)"
+	elif printf '%s' "$out" | grep -q 'getpid *returned'; then
+		ok "check notices a filter that permits more than the profile"
+	else
+		nok "check notices a filter that permits more than the profile" "$out"
+	fi
+fi
+
+# A check that happened to probe only permitted syscalls would report
+# success having tested nothing about denial. It refuses.
+{ head -2 "$TMP/echo.p"
+  { tail -n +3 "$TMP/echo.p"
+    printf '24\n39\n96\n102\n104\n107\n108\n110\n186\n201\n'
+  } | sort -n | uniq
+} > "$TMP/all.p"
+out=$("$PWD/profiled" check "$TMP/all.p" 2>&1)
+if [ $? -eq 0 ]; then
+	nok "a check that tests no denial refuses" "it reported success"
+elif printf '%s' "$out" | grep -q 'nothing about denial'; then
+	ok "a check that tests no denial refuses, by name"
+else
+	nok "a check that tests no denial refuses" "$out"
+fi
+
 # ----------------------------------------------- the profile is read strictly
 # Every line is understood or refused. A reader that skips what it does
 # not recognise turns a typo into a policy permitting less than the
