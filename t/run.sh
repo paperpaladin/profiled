@@ -315,6 +315,58 @@ else
 	fi
 fi
 
+# Three more planted defects, because each of these branches is
+# unreachable while the program is correct, and a branch no test can
+# reach is a branch no test is checking. Each sed must keep the
+# instruction count: the assertion in build_filter catches a change in
+# length before any of this gets a chance to be wrong.
+plant() { # name, sed expression, expected substring
+	sed "$2" profiled.c > "$TMP/pl.c"
+	if cmp -s profiled.c "$TMP/pl.c"; then
+		nok "planted: $1" "the sed matched nothing"
+		return
+	fi
+	cc -std=c11 -O1 -w -o "$TMP/pl" "$TMP/pl.c" || { nok "planted: $1" "did not build"; return; }
+	out=$("$TMP/pl" check "$TMP/echo.p" 2>&1)
+	if [ $? -eq 0 ]; then
+		nok "check notices $1" "it reported success"
+	elif printf '%s' "$out" | grep -q "$3"; then
+		ok "check notices $1"
+	else
+		nok "check notices $1" "$(printf '%s' "$out" | tail -2 | tr '\n' ' ')"
+	fi
+}
+
+# An instruction the interpreter does not model. It must say so rather
+# than shrug: an interpreter that treats what it cannot read as a
+# no-op reports a verdict on a filter it never understood.
+plant "a filter instruction it cannot model" \
+      's/seccomp_data, nr));/seccomp_data, args[0]));/' \
+      "does not model"
+
+# An opcode outside the three this interpreter models at all, as
+# opposed to a field it does not know. Different branch, and the one
+# that decides whether an unreadable filter is reported or shrugged
+# at: with this plant nothing else goes wrong, so the exit status
+# rests entirely on the unmodelled count being counted.
+plant "an opcode outside the three it models" \
+      's/case BPF_LD | BPF_W | BPF_ABS:/case BPF_LD | BPF_W | BPF_IND:/' \
+      "does not model"
+
+# The architecture guard removed. Another ABI reaches the same kernel
+# through different numbers, so every one of them has to be killed
+# rather than judged against a table that does not apply.
+plant "an architecture guard that does not guard" \
+      's/AUDIT_ARCH_X86_64, 1, 0);/AUDIT_ARCH_X86_64, 1, 1);/' \
+      "wrong ABI"
+
+# The interpreter itself wrong. Caught by the exhaustive pass rather
+# than by any comparison against the kernel: a model that misreads the
+# syscall number disagrees with the profile on 29 of 1024.
+plant "an interpreter that misreads the syscall number" \
+      's/seccomp_data, nr)) A = nr;/seccomp_data, nr)) A = nr + 1;/' \
+      "disagree with the profile"
+
 # A check that happened to probe only permitted syscalls would report
 # success having tested nothing about denial. It refuses.
 { head -2 "$TMP/echo.p"
