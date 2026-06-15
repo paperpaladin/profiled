@@ -318,8 +318,17 @@ static int record(const char *outpath, char **argv) {
 // Built once and used twice: installed in the kernel, and interpreted
 // by eval_filter below. Interpreting a different program than the one
 // installed would prove nothing, so there is one builder.
+// What a denied call does. Two different policies with two different
+// failure modes, so neither is the silent default: KILL stops the
+// program at the offending call, which is unambiguous and loses
+// whatever it was doing; ERRNO makes the call fail, which lets a
+// program that checks its return values degrade instead, and lets one
+// that does not carry on with a wrong answer.
+enum { DENY_KILL, DENY_ERRNO };
+#define DENY_ERRNO_VALUE EPERM
+
 static struct sock_filter *build_filter(const unsigned char *set, int n,
-                                        int *out_len) {
+                                        int mode, int *out_len) {
   // Four for the preamble (load arch, compare, kill, load nr), one
   // comparison per permitted syscall, then kill and allow. The first
   // version of this said "2 per syscall", counting a load that happens
@@ -338,6 +347,14 @@ static struct sock_filter *build_filter(const unsigned char *set, int n,
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0);
   struct sock_filter kill =
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+  // The arch mismatch above always kills. Softening that one to an
+  // errno would let a process on another ABI keep running while its
+  // syscall numbers mean something this profile never judged.
+  struct sock_filter deny =
+      BPF_STMT(BPF_RET | BPF_K,
+               mode == DENY_ERRNO
+                   ? (SECCOMP_RET_ERRNO | (DENY_ERRNO_VALUE & SECCOMP_RET_DATA))
+                   : SECCOMP_RET_KILL_PROCESS);
   struct sock_filter ld_nr =
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                (unsigned)offsetof(struct seccomp_data, nr));
@@ -364,7 +381,7 @@ static struct sock_filter *build_filter(const unsigned char *set, int n,
     }
     prog[k++] = j;
   }
-  prog[k++] = kill;
+  prog[k++] = deny;
   prog[k++] = allow;
 
   // The jump offsets above are computed from `len`, so a `len` that
@@ -379,9 +396,9 @@ static struct sock_filter *build_filter(const unsigned char *set, int n,
   return prog;
 }
 
-static int install_allow(const unsigned char *set, int n) {
+static int install_allow(const unsigned char *set, int n, int mode) {
   int len = 0;
-  struct sock_filter *prog = build_filter(set, n, &len);
+  struct sock_filter *prog = build_filter(set, n, mode, &len);
   if (!prog) return -1;
 
   struct sock_fprog fprog = { .len = (unsigned short)len, .filter = prog };
@@ -429,11 +446,11 @@ static long eval_filter(const struct sock_filter *prog, int len,
   return -1;                                 // ran off the end
 }
 
-static int apply(const char *path, char **argv) {
+static int apply(const char *path, int mode, char **argv) {
   static unsigned char set[NR_MAX];
   int n = read_profile(path, set);
   if (n < 0) return 2;
-  if (install_allow(set, n) < 0) return 2;
+  if (install_allow(set, n, mode) < 0) return 2;
   execvp(argv[0], argv);
   fprintf(stderr, "profiled: %s: %s\n", argv[0], strerror(errno));
   return 127;
@@ -467,38 +484,43 @@ static const struct { int nr; const char *name; } PROBES[] = {
 // Runs one probe in a child under the filter. Returns 1 if the kernel
 // killed it with SIGSYS, 0 if the call returned, -1 if something else
 // happened and the result cannot be read.
-static int probe_under(const unsigned char *set, int n, int nr) {
+static int probe_under(const unsigned char *set, int n, int mode, int nr) {
   fflush(NULL);
   pid_t pid = fork();
   if (pid < 0) { perror("profiled: fork"); return -1; }
   if (pid == 0) {
     struct rlimit no_core = { 0, 0 };
     setrlimit(RLIMIT_CORE, &no_core);
-    if (install_allow(set, n) < 0) _exit(2);
+    if (install_allow(set, n, mode) < 0) _exit(2);
+    errno = 0;
     syscall(nr);
+    // In errno mode the kernel does not kill, it fails the call, so
+    // the child has to report which errno came back. 3 means denied.
+    if (mode == DENY_ERRNO && errno == DENY_ERRNO_VALUE) _exit(3);
     _exit(0);
   }
   int st;
   if (waitpid(pid, &st, 0) < 0) { perror("profiled: waitpid"); return -1; }
   if (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) return 1;
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 3) return 1;   // errno mode
   if (WIFEXITED(st) && WEXITSTATUS(st) == 0) return 0;
   return -1;
 }
 
-static int check(const char *path) {
+static int check(const char *path, int mode) {
   static unsigned char set[NR_MAX];
   int n = read_profile(path, set);
   if (n < 0) return 2;
 
   int len = 0;
-  struct sock_filter *prog = build_filter(set, n, &len);
+  struct sock_filter *prog = build_filter(set, n, mode, &len);
   if (!prog) return 2;
 
   int denied = 0, permitted = 0, bad = 0;
   for (int i = 0; i < PROBES_N; i++) {
     int nr = PROBES[i].nr;
-    int want_kill = !set[nr];
-    int got = probe_under(set, n, nr);
+    int want_denied = !set[nr];
+    int got = probe_under(set, n, mode, nr);
 
     // There was a cross-check here requiring the interpreter's verdict
     // on this number to match the kernel's. It was deleted because it
@@ -511,13 +533,13 @@ static int check(const char *path) {
     if (got < 0) {
       printf("  %-13s could not be read\n", PROBES[i].name);
       bad++;
-    } else if (got != want_kill) {
+    } else if (got != want_denied) {
       printf("  %-13s %s, and the profile says it should %s\n",
              PROBES[i].name,
-             got ? "was killed" : "returned",
-             want_kill ? "be denied" : "be permitted");
+             got ? "was denied" : "returned",
+             want_denied ? "be denied" : "be permitted");
       bad++;
-    } else if (want_kill) {
+    } else if (want_denied) {
       denied++;
     } else {
       permitted++;
@@ -556,7 +578,10 @@ static int check(const char *path) {
   for (int nr = 0; nr < NR_MAX; nr++) {
     long act = eval_filter(prog, len, AUDIT_ARCH_X86_64, (unsigned)nr);
     if (act < 0) { unmodelled++; continue; }
-    long want = set[nr] ? SECCOMP_RET_ALLOW : SECCOMP_RET_KILL_PROCESS;
+    long deny_act = mode == DENY_ERRNO
+        ? (SECCOMP_RET_ERRNO | (DENY_ERRNO_VALUE & SECCOMP_RET_DATA))
+        : SECCOMP_RET_KILL_PROCESS;
+    long want = set[nr] ? SECCOMP_RET_ALLOW : deny_act;
     if (act != want) {
       if (wrong_nr < 3)
         printf("  syscall %d would be %s, the profile says %s\n", nr,
@@ -601,10 +626,12 @@ static void usage(void) {
         "usage: profiled record -o FILE -- CMD [ARG...]\n"
         "  writes the syscall numbers CMD made to FILE, one per line,\n"
         "  sorted. Never to stdout: the traced program has that one.\n"
-        "usage: profiled apply FILE -- CMD [ARG...]\n"
+        "usage: profiled apply [--deny kill|errno] FILE -- CMD [ARG...]\n"
         "  installs FILE as a seccomp policy, then runs CMD under it.\n"
-        "usage: profiled check FILE\n"
-        "  issues syscalls FILE omits and requires the kernel to kill.\n",
+        "  kill (the default) stops the program at the offending call;\n"
+        "  errno fails the call with EPERM and lets it carry on.\n"
+        "usage: profiled check [--deny kill|errno] FILE\n"
+        "  issues syscalls FILE omits and requires the kernel to refuse.\n",
         stderr);
 }
 
@@ -631,13 +658,27 @@ int main(int argc, char **argv) {
     if (i >= argc) { usage(); return 2; }
     return record(argv[3], argv + i);
   }
+  // --deny is parsed before the subcommand's own arguments so the
+  // two subcommands that take it do so identically.
+  int mode = DENY_KILL, a = 1;
+  if (argc >= 3 && !strcmp(argv[2], "--deny")) {
+    if (argc < 4) { usage(); return 2; }
+    if (!strcmp(argv[3], "errno")) mode = DENY_ERRNO;
+    else if (!strcmp(argv[3], "kill")) mode = DENY_KILL;
+    else { fprintf(stderr, "profiled: --deny takes kill or errno, not %s\n",
+                   argv[3]); return 2; }
+    for (int j = 2; j + 2 < argc; j++) argv[j] = argv[j + 2];
+    argc -= 2;
+  }
+  (void)a;
+
   if (argc >= 4 && !strcmp(argv[1], "apply")) {
     int i = 3;
     if (!strcmp(argv[i], "--")) i++;
     if (i >= argc) { usage(); return 2; }
-    return apply(argv[2], argv + i);
+    return apply(argv[2], mode, argv + i);
   }
-  if (argc == 3 && !strcmp(argv[1], "check")) return check(argv[2]);
+  if (argc == 3 && !strcmp(argv[1], "check")) return check(argv[2], mode);
   usage();
   return 2;
 }
