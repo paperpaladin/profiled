@@ -201,11 +201,34 @@ Ranked by how little we control them.
            not a bug here, it is what choosing errno means for a
            program that does not check its return values, and it is
            demonstrated rather than described.
-- [ ] 10 mutation testing of the whole gate
+- [x] 10 mutation testing of the whole gate
       why: plant a syscall in the profile that the program never
            made and require the tightness check to notice; remove
            one it did make and require the sufficiency check to
            notice. Both directions, both seen failing.
+      done: both directions, and they do not come out symmetrically.
+           Too small is caught hard: remove write(1) from echo's
+           profile and the program dies at the first thing it prints.
+           Too large is caught by nothing. Add kill(62), which echo
+           never calls, and check still reports 0 wrong, because the
+           filter does faithfully deny everything the profile omits.
+           The item's premise was that the tightness check would
+           notice, and it does not, because "tight" here means the
+           installed filter matches the profile and not that the
+           profile is the smallest one that works. Those are
+           different properties and this says so rather than
+           stretching the word.
+           The property that does catch it is minimality against a
+           recording: record the same workload again and require the
+           profile to contain nothing the recording did not produce.
+           That is a comparison between two runs rather than a check
+           on one file, and it is in the suite in both directions,
+           including the half that would otherwise pass for the wrong
+           reason: the real profile must itself have nothing extra.
+           Also: process substitution is a bashism and this suite
+           runs under /bin/sh, where it is a syntax error. Caught
+           immediately rather than silently, which is the one good
+           thing about dash.
 - [ ] 11 README with the measured numbers and the coverage caveat
       why: last, so the numbers are the ones the suite prints, and
            the caveat is first in the document rather than last.

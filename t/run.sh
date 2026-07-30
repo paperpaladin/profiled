@@ -479,6 +479,71 @@ else
 	nok "a check that tests no denial refuses" "$out"
 fi
 
+# ------------------------------------- mutating the profile, both ways
+# The source mutations above ask whether the code is right. These ask
+# whether the checks would notice a profile that is wrong, which is a
+# different question and has a less comfortable answer.
+#
+# Too small is caught, and caught hard. Remove write(1) from echo's
+# profile and the program dies at the first thing it tries to print.
+grep -vx 1 "$TMP/echo.p" > "$TMP/small.p"
+if cmp -s "$TMP/echo.p" "$TMP/small.p"; then
+	nok "planted: a profile missing a syscall the program uses" \
+	    "write(1) was not in the profile to begin with"
+else
+	got=$(./t/waitstat -q "$PWD/profiled" apply "$TMP/small.p" -- \
+	      /bin/echo hi 2>/dev/null)
+	eq "a profile missing one syscall kills the program" "signal 31" "$got"
+fi
+
+# Too large is caught by nothing here, and that is worth stating
+# rather than leaving for someone to discover. "Tight" in this program
+# means the installed filter matches the profile. It does not mean the
+# profile is the smallest one that works. Add kill(62), which echo
+# never calls: check still reports 0 wrong, because the filter does
+# faithfully deny everything the profile omits, and apply still runs
+# the program.
+#
+# The property that does catch it is minimality against a recording,
+# and it is a comparison rather than a check: record the same workload
+# again and require the profile to contain nothing the recording did
+# not produce.
+{ head -2 "$TMP/echo.p"
+  { tail -n +3 "$TMP/echo.p"; echo 62; } | sort -n | uniq
+} > "$TMP/big.p"
+
+out=$("$PWD/profiled" check "$TMP/big.p" 2>&1)
+if [ $? -eq 0 ] && printf '%s' "$out" | grep -q '0 wrong'; then
+	ok "check calls an over-wide profile tight, which is what tight means here"
+else
+	nok "check calls an over-wide profile tight" \
+	    "it reported a problem, so the README paragraph about this is now wrong"
+fi
+
+timeout 60 "$PWD/profiled" record -o "$TMP/fresh.p" -- /bin/echo hi \
+	> /dev/null 2>&1
+# Plain files and not process substitution: this suite runs under
+# /bin/sh, where <(...) is a syntax error rather than a feature.
+tail -n +3 "$TMP/big.p"   | sort > "$TMP/big.sorted"
+tail -n +3 "$TMP/fresh.p" | sort > "$TMP/fresh.sorted"
+extra=$(comm -23 "$TMP/big.sorted" "$TMP/fresh.sorted" | tr '\n' ' ')
+if [ "$(printf '%s' "$extra" | tr -d ' ')" = "62" ]; then
+	ok "a fresh recording names the syscall the profile did not need: $extra"
+else
+	nok "a fresh recording names the unneeded syscall" "found [$extra]"
+fi
+
+# And the honest other half of that comparison: the real profile must
+# have nothing extra in it, or the check above would pass for the
+# wrong reason.
+tail -n +3 "$TMP/echo.p" | sort > "$TMP/echo.sorted"
+extra=$(comm -23 "$TMP/echo.sorted" "$TMP/fresh.sorted" | tr '\n' ' ')
+if [ -z "$(printf '%s' "$extra" | tr -d ' ')" ]; then
+	ok "the recorded profile itself is minimal against a fresh recording"
+else
+	nok "the recorded profile itself is minimal" "extra:$extra"
+fi
+
 # ------------------------------------------------- kill or errno
 # Two policies with two different failure modes, so neither is the
 # silent default.

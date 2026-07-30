@@ -3,7 +3,7 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
-**Eight commits in.** `record`, `apply` and `check` all work: a program
+**Nine commits in.** `record`, `apply` and `check` all work: a program
 can be watched, run under a policy built from what it did, and the
 policy shown to deny what it omits, for all 1024 syscall numbers and
 a second ABI.
@@ -41,7 +41,7 @@ ok    execve is in the profile, because apply has to exec under it
 ok    no syscall only the recorder makes is in the profile
 ok    two recordings of the same workload are byte-identical
 
-56 passed, 0 failed
+60 passed, 0 failed
 ```
 
 
@@ -262,6 +262,29 @@ being deleted, because the hazard will not have gone away.
 It is also what the suite got wrong first. The sufficiency check
 recorded with stdout inherited and applied with stdout to a file, and
 `cat` died under what looked like its own profile.
+
+## Tight is not the same as minimal
+
+Mutating the profile rather than the source asks a different
+question, and the answer is asymmetric.
+
+Remove a syscall the program uses and it dies at the first call that
+needs it. The sufficiency check catches that immediately.
+
+Add one it never makes and nothing here objects. `check` reports `0
+wrong`, and it is right to: the installed filter does faithfully deny
+everything the profile omits. **Tight** in this program means the
+filter matches the profile. It does not mean the profile is the
+smallest one that works, and stretching the word to cover both would
+be the kind of claim this collection exists to avoid.
+
+The property that catches an over-wide profile is minimality against
+a recording: record the same workload again and require the profile
+to contain nothing the recording did not produce. That is a
+comparison between two runs rather than a check on one file, and it
+is in the suite in both directions, including the half that would
+otherwise pass for the wrong reason, which is that the real profile
+must itself have nothing extra in it.
 
 ## kill, or errno
 
