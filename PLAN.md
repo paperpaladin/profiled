@@ -229,6 +229,15 @@ Ranked by how little we control them.
            runs under /bin/sh, where it is a syntax error. Caught
            immediately rather than silently, which is the one good
            thing about dash.
-- [ ] 11 README with the measured numbers and the coverage caveat
+- [x] 11 README with the measured numbers and the coverage caveat
       why: last, so the numbers are the ones the suite prints, and
            the caveat is first in the document rather than last.
+      done: the caveat is the second paragraph, before any claim. It
+           has two halves and the second is the one people will not
+           expect: a profile is not a property of a program, it is a
+           property of the program and the environment it ran in.
+           Every number in the document is one the suite prints, and
+           one stale item was removed in the pass: the README still
+           listed SECCOMP_RET_ERRNO as missing two commits after it
+           was implemented, which is the exact drift this item
+           exists to catch.
