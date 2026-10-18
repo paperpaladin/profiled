@@ -427,6 +427,56 @@ else
 	nok "a check that tests no denial refuses" "$out"
 fi
 
+# ------------------------------------------------- kill or errno
+# Two policies with two different failure modes, so neither is the
+# silent default.
+#
+# kill stops the program at the offending call. errno fails the call
+# and lets it carry on, which is the gentler option only for a
+# program that checks its return values.
+#
+# cat is not such a program here, and the contrast is the case. Under
+# the echo profile with --deny kill it dies of SIGSYS. With --deny
+# errno it exits 0 and prints 47000-odd bytes of whatever was in the
+# buffer, where the correct output is one byte. Neither is a bug in
+# profiled: it is what choosing errno means, demonstrated rather than
+# described.
+got=$(./t/waitstat -q "$PWD/profiled" apply "$TMP/echo.p" -- \
+      /bin/cat /etc/hostname 2>/dev/null)
+eq "--deny kill: the program dies at the denied call" "signal 31" "$got"
+
+"$PWD/profiled" apply --deny errno "$TMP/echo.p" -- /bin/cat /etc/hostname \
+	> "$TMP/errno.out" 2>/dev/null
+st=$?
+if [ "$st" -ne 0 ]; then
+	nok "--deny errno: the program survives the denied call" "it exited $st"
+elif cmp -s "$TMP/errno.out" /etc/hostname; then
+	nok "--deny errno: the program survives and its output is wrong" \
+	    "the output was correct, so this case no longer shows anything"
+else
+	ok "--deny errno: the program survives, exits 0, and prints the wrong thing"
+fi
+
+# check has to follow the mode. In errno mode a denied probe returns
+# EPERM instead of dying, so a check that only looked for SIGSYS would
+# report every syscall wrongly permitted.
+out=$("$PWD/profiled" check --deny errno "$TMP/echo.p" 2>&1)
+if [ $? -eq 0 ] && printf '%s' "$out" | grep -q '0 wrong'; then
+	ok "check under --deny errno: $(printf '%s' "$out" | tail -1 | sed 's/^check: //' | cut -c1-54)"
+else
+	nok "check follows --deny errno"
+	printf '%s\n' "$out" | head -4 | sed 's/^/        /'
+fi
+
+out=$("$PWD/profiled" apply --deny shout "$TMP/echo.p" -- /bin/true 2>&1)
+if [ $? -eq 0 ]; then
+	nok "an unknown --deny value is refused" "it was accepted"
+elif printf '%s' "$out" | grep -q 'kill or errno'; then
+	ok "an unknown --deny value is refused, by name"
+else
+	nok "an unknown --deny value is refused" "$out"
+fi
+
 # ----------------------------------------------- the profile is read strictly
 # Every line is understood or refused. A reader that skips what it does
 # not recognise turns a typo into a policy permitting less than the

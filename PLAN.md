@@ -181,11 +181,26 @@ Ranked by how little we control them.
       why: one program is one data point, and a profile derived from
            a short-lived process will not exercise the paths a
            long-lived one does.
-- [ ] 09 what happens on a denied call: kill, or errno
+- [x] 09 what happens on a denied call: kill, or errno
       why: SECCOMP_RET_KILL_PROCESS and SECCOMP_RET_ERRNO are
            different policies with different failure modes, and
            picking one silently is the kind of choice that should be
            a flag with both tested.
+      done: --deny kill (the default) and --deny errno, on both apply
+           and check. check has to follow the mode: in errno mode a
+           denied probe returns EPERM rather than dying, so a check
+           that only looked for SIGSYS would report every syscall
+           wrongly permitted. That mutation is caught.
+           The arch mismatch always kills, in both modes. Softening
+           it would let a process on another ABI carry on while its
+           syscall numbers mean something this profile never judged.
+           What makes the case worth having is cat. Under the echo
+           profile with --deny kill it dies of SIGSYS. With --deny
+           errno it exits 0 and prints 47594 bytes of whatever was in
+           the buffer, where the correct output is one byte. That is
+           not a bug here, it is what choosing errno means for a
+           program that does not check its return values, and it is
+           demonstrated rather than described.
 - [ ] 10 mutation testing of the whole gate
       why: plant a syscall in the profile that the program never
            made and require the tightness check to notice; remove

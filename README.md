@@ -3,7 +3,7 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
-**Six commits in.** `record`, `apply` and `check` all work: a program
+**Seven commits in.** `record`, `apply` and `check` all work: a program
 can be watched, run under a policy built from what it did, and the
 policy shown to deny what it omits, for all 1024 syscall numbers and
 a second ABI.
@@ -41,7 +41,7 @@ ok    execve is in the profile, because apply has to exec under it
 ok    no syscall only the recorder makes is in the profile
 ok    two recordings of the same workload are byte-identical
 
-44 passed, 0 failed
+48 passed, 0 failed
 ```
 
 
@@ -242,6 +242,37 @@ being deleted, because the hazard will not have gone away.
 It is also what the suite got wrong first. The sufficiency check
 recorded with stdout inherited and applied with stdout to a file, and
 `cat` died under what looked like its own profile.
+
+## kill, or errno
+
+A denied call can stop the program or fail. Neither is the silent
+default: `--deny kill` and `--deny errno`, on both `apply` and
+`check`.
+
+The contrast is best shown by a program that gets it wrong. Under the
+`echo` profile, `cat /etc/hostname`:
+
+```
+$ profiled apply --deny kill  echo.p -- /bin/cat /etc/hostname
+Bad system call (core dumped)
+$ profiled apply --deny errno echo.p -- /bin/cat /etc/hostname | wc -c
+47594
+```
+
+The correct output is one byte. `cat` does not check the return of
+the call that was denied, so it carries on and prints whatever was in
+the buffer, and exits 0 while doing it. That is not a bug here. It is
+what choosing `errno` means, and it is why the choice is a flag with
+both sides tested rather than a default nobody reads.
+
+`check` follows the mode, and has to: in `errno` mode a denied probe
+returns `EPERM` instead of dying, so a check that only looked for
+`SIGSYS` would report every syscall wrongly permitted. That mutation
+is caught.
+
+The architecture mismatch always kills, in both modes. Softening it
+would let a process on another ABI carry on while its syscall numbers
+mean something this profile never judged.
 
 ## Reading a profile strictly
 
