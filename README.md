@@ -3,10 +3,9 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
-**Three commits in.** `record` and `apply` both work: a program can be
-watched, and then run under a policy built from what it did. `check`,
-the half that proves the policy is tight rather than merely
-sufficient, is not written.
+**Four commits in.** `record`, `apply` and `check` all work: a program
+can be watched, run under a policy built from what it did, and the
+policy can be shown to deny what it omits.
 
 ```
 $ profiled record -o echo.p -- /bin/echo hi
@@ -21,6 +20,8 @@ $ profiled apply echo.p -- /bin/echo hi
 hi
 $ profiled apply echo.p -- /bin/cat /etc/hostname
 Bad system call (core dumped)
+$ profiled check echo.p
+check: 10 denied as expected, 0 permitted as expected, 0 wrong
 ```
 
 ```
@@ -32,10 +33,12 @@ ok    [/bin/echo hello] runs identically under its own profile
 ok    [/bin/cat /etc/hostname] runs identically under its own profile
 ok    another program under that profile is killed
 ok    a profile recorded with stdout elsewhere kills the same command
+ok    check: 10 denied as expected, 0 permitted as expected, 0 wrong
+ok    check notices a filter that permits more than the profile
 ok    refuses a profile for another architecture, by name
 ok    two recordings of the same workload are byte-identical
 
-33 passed, 0 failed
+37 passed, 0 failed
 ```
 
 
@@ -118,6 +121,45 @@ The two fixes are a pair, and the suite shows it: removing
 `event == 0` guard on its own is an equivalent mutant as long as
 `TRACEEXEC` stays set.
 
+## The half that is easy to fake
+
+`apply` running the program proves the policy is sufficient. It says
+nothing about whether the policy is tight, and a policy that permits
+everything is sufficient for every program.
+
+So `check` issues syscalls the profile omits and requires the kernel
+to kill the process with `SIGSYS`, and issues ones it permits and
+requires them to return. Both directions, because a filter that
+killed everything would satisfy the first on its own.
+
+The probes are ten pure syscalls rather than all 1024 numbers, and
+the reason is the check itself. It confirms that a denied call is
+stopped *before it runs*; if the filter is wrong, the call runs.
+Issuing an arbitrary syscall in a process whose filter might be
+broken is precisely the thing not to do. So every probe reads a
+number the kernel already knows and changes nothing. The cost is
+that the deny path is demonstrated on ten syscalls and not on all of
+them, and closing that needs the filter read back out of the kernel
+with `PTRACE_SECCOMP_GET_FILTER` and checked against the profile
+number by number. That is not done.
+
+A check that happened to probe only permitted syscalls would report
+success having tested nothing about denial, so it refuses instead.
+
+### What this one got wrong
+
+`check` tests the filter builder, not the profile, so the two can
+only disagree when the builder is wrong, which means nothing in the
+suite had ever seen `check` report a wrong answer. A mutation making
+it always say "tight" passed everything.
+
+The fix is a planted defect: a copy of the source whose filter
+permits `getpid` in place of `write`, built and run, and `check` has
+to notice. The first attempt planted an *extra* permitted syscall and
+was caught by the instruction-count assertion before `check` could be
+wrong at all, which is the assertion working and the test not. It is
+a mis-aimed comparison now, so the count is unchanged.
+
 ## A profile is not a property of a program
 
 It is a property of the program **and the environment it ran in**, and
@@ -162,6 +204,11 @@ makes a profile reviewable in a diff.
 Two mutations survive and both are genuinely equivalent rather than
 untested:
 
+- Requiring `SIGSYS` specifically rather than any signal in `check`.
+  The only way a probe child dies here is `SIGSYS`, so the
+  specificity is defensive.
+- Treating an unreadable probe result as a pass. The next branch
+  catches it anyway, since -1 matches neither expected answer.
 - Recording both halves of each syscall stop instead of the entry.
   `orig_rax` holds the same value at both, and the second write lands
   on the same bit of a set. The entry-only toggle is kept because a
@@ -180,10 +227,11 @@ requiring the gate to see it.
 
 Everything else. In the order it is planned:
 
-- `check`, which is the half of the claim that is easy to fake.
-  `apply` runs the program and `another program under that profile is
-  killed` is the cheap version of tightness; issuing a specific
-  omitted syscall and requiring SIGSYS is the real one.
+- Exhaustive tightness. `check` probes ten syscalls, not all 1024.
+  Reading the filter back with `PTRACE_SECCOMP_GET_FILTER` and
+  checking it against the profile number by number would close it,
+  and the program bytes would come from the kernel rather than from
+  our own array.
 - Filtering on arguments. The policy is syscall numbers only, so
   `openat` is permitted or not, never permitted for one path.
 - `SECCOMP_RET_ERRNO`. A denied call kills the process and there is

@@ -106,11 +106,32 @@ Ranked by how little we control them.
            assertion that the emitted count matches the computed one.
            Nine mutations across the reader and the filter, all
            caught.
-- [ ] 06 check: prove the profile is tight
+- [x] 06 check: prove the profile is tight
       why: the second half, and the one that is easy to fake. A
            syscall outside the profile has to be issued and the
            process has to die of SIGSYS. Without this, "minimal
            profile" is an adjective.
+      done: ten pure syscalls, both directions, with a refusal when a
+           profile permits all of them because such a run tests
+           nothing about denial.
+           The probes are pure for a reason that is the check's own
+           argument: it confirms a denied call is stopped before it
+           runs, so if the filter is wrong the call runs. Issuing an
+           arbitrary syscall under those conditions is the thing not
+           to do.
+           check's own failure path was unreachable, because it tests
+           the filter builder and the suite only ever gave it correct
+           profiles: a mutation making it always report "tight"
+           passed. A planted defect fixes that, and the first attempt
+           at planting one was caught by the instruction-count
+           assertion before check could be wrong, so it is now a
+           mis-aimed comparison that keeps the count.
+- [ ] 06b exhaustive tightness via PTRACE_SECCOMP_GET_FILTER
+      why: check probes ten syscalls and the profile omits a thousand.
+           Reading the installed filter back out of the kernel and
+           evaluating it for every number closes that without issuing
+           a single dangerous call, and the bytes come from the kernel
+           rather than from our own array.
 - [ ] 07 the recorder's own syscalls must not leak into the profile
       why: ptrace sees the tracee, but exec, mmap and the dynamic
            loader run before main and belong to the program. The
