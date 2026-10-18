@@ -64,7 +64,7 @@ Ranked by how little we control them.
 
 ## Commit sequence
 
-- [ ] 01 the rig, and a seccomp filter that is known to bite
+- [x] 01 the rig, and a seccomp filter that is known to bite
       why: everything here rests on "the kernel killed it", so that
            has to be demonstrated before anything is built on top.
            The first commit installs a filter denying one syscall,
@@ -72,11 +72,19 @@ Ranked by how little we control them.
            that cannot observe the kill cannot test any of the rest,
            and this is the collection's standing lesson: a gate
            nobody has seen fail may be checking nothing.
-- [ ] 02 record: the syscall set of one run, via PTRACE_SYSCALL
+- [x] 02 record: the syscall set of one run, via PTRACE_SYSCALL
       why: the input to everything else. Numbers only, no decoding.
-- [ ] 03 the same run under strace, and the two sets compared
+- [x] 03 the same run under strace, and the two sets compared
       why: a recorder checked against itself proves nothing. This is
            the first point where an outside observer can disagree.
+      done: committed together with 02, because the comparison is what
+           made 02 correct rather than what confirmed it. Three bugs,
+           all found by strace and none visible in the code: the
+           recorder wrote the profile to the stdout the program was
+           using, dropping signals hung any tracee waiting on a child,
+           and handing every signal back killed every tracee at exec.
+           Also: strace -c is the wrong view, because it counts calls
+           that returned and exit_group never does.
 - [ ] 04 the profile file: text, sorted, with the ABI named in it
       why: sorted so two recordings of the same workload produce the
            same bytes, and the ABI named so a profile cannot be
