@@ -3,6 +3,20 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
+**Read this before anything else.** A profile covers the paths the
+recorded run took. It is not a safe policy for paths it did not take,
+and nothing here can make it one: a program whose error handling
+calls `unlink` will be killed the first time it hits an error, if the
+recording never did. Every number below is measured, and none of them
+is evidence that a profile is complete for a workload it did not see.
+
+Worse, and less obvious: a profile is not a property of a program at
+all. It is a property of the program **and the environment it ran
+in**. `cat` copies to a regular file with `copy_file_range` and to a
+pipe with `read` and `write`, so a profile recorded with output going
+one place kills the identical command line when its output goes
+somewhere else. That is a test here, not a warning.
+
 **Nine commits in.** `record`, `apply` and `check` all work: a program
 can be watched, run under a policy built from what it did, and the
 policy shown to deny what it omits, for all 1024 syscall numbers and
@@ -221,11 +235,14 @@ was caught by the instruction-count assertion before `check` could be
 wrong at all, which is the assertion working and the test not. It is
 a mis-aimed comparison now, so the count is unchanged.
 
-There are five planted defects in all, one per branch that cannot be
-reached while the program is correct: a filter permitting more than
-the profile, a load from a field the interpreter does not model, an
-opcode outside the three it models, an architecture guard that does
-not guard, and an interpreter that misreads the syscall number.
+There are five planted defects in the source, one per branch that
+cannot be reached while the program is correct: a filter permitting
+more than the profile, a load from a field the interpreter does not
+model, an opcode outside the three it models, an architecture guard
+that does not guard, and an interpreter that misreads the syscall
+number. Two more are planted in the profile rather than the source,
+one too small and one too large, and they are the subject of "Tight
+is not the same as minimal".
 
 ## Where the program starts
 
@@ -377,9 +394,8 @@ Everything else. In the order it is planned:
   ten concrete probes and the argument above, not a direct read.
 - Filtering on arguments. The policy is syscall numbers only, so
   `openat` is permitted or not, never permitted for one path.
-- `SECCOMP_RET_ERRNO`. A denied call kills the process and there is
-  no option to fail it instead, which is a different policy with
-  different failure modes.
+- Minimality is not checked by `check`, only by comparing a profile
+  against a fresh recording. See "Tight is not the same as minimal".
 - **Child processes.** The recorder does not follow them, so a
   program that forks gets a profile covering the parent only. It
   refuses rather than writing a profile that would kill the program
@@ -388,11 +404,9 @@ Everything else. In the order it is planned:
   signal-delivery-stop, so a program that stops itself with `SIGTSTP`
   is silently continued. `PTRACE_GETSIGINFO` and `PTRACE_LISTEN` are
   the correct handling.
-- **The coverage problem, which no amount of code fixes.** A profile
-  derived from one run covers the paths that run took. It is not a
-  safe policy for paths that did not, and this will be the first
-  sentence of this README when there is a profile to derive. Saying
-  it now so it does not arrive as a footnote later.
+- **The coverage problem, which no amount of code fixes.** It is the
+  first thing in this document rather than the last item here, which
+  is where it would have ended up.
 - Landlock path policy, which is `jail`'s job, and syscall decoding,
   which is `trace`'s. This is the syscall-permission layer only.
 - Architectures other than x86-64.
