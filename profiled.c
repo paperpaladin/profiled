@@ -315,7 +315,11 @@ static int record(const char *outpath, char **argv) {
 
 // Allow the listed syscalls, kill on anything else. The architecture
 // check is the same one the probe filter uses and for the same reason.
-static int install_allow(const unsigned char *set, int n) {
+// Built once and used twice: installed in the kernel, and interpreted
+// by eval_filter below. Interpreting a different program than the one
+// installed would prove nothing, so there is one builder.
+static struct sock_filter *build_filter(const unsigned char *set, int n,
+                                        int *out_len) {
   // Four for the preamble (load arch, compare, kill, load nr), one
   // comparison per permitted syscall, then kill and allow. The first
   // version of this said "2 per syscall", counting a load that happens
@@ -324,7 +328,7 @@ static int install_allow(const unsigned char *set, int n) {
   // why that is a one-time mistake.
   int len = 4 + n + 2;
   struct sock_filter *prog = calloc((size_t)len, sizeof *prog);
-  if (!prog) { fputs("profiled: out of memory\n", stderr); return -1; }
+  if (!prog) { fputs("profiled: out of memory\n", stderr); return NULL; }
 
   int k = 0;
   struct sock_filter ld_arch =
@@ -356,7 +360,7 @@ static int install_allow(const unsigned char *set, int n) {
     if (to_allow > 255) {
       fputs("profiled: too many syscalls for a flat filter\n", stderr);
       free(prog);
-      return -1;
+      return NULL;
     }
     prog[k++] = j;
   }
@@ -369,10 +373,18 @@ static int install_allow(const unsigned char *set, int n) {
   if (k != len) {
     fprintf(stderr, "profiled: filter is %d instructions, expected %d\n", k, len);
     free(prog);
-    return -1;
+    return NULL;
   }
+  *out_len = len;
+  return prog;
+}
 
-  struct sock_fprog fprog = { .len = (unsigned short)k, .filter = prog };
+static int install_allow(const unsigned char *set, int n) {
+  int len = 0;
+  struct sock_filter *prog = build_filter(set, n, &len);
+  if (!prog) return -1;
+
+  struct sock_fprog fprog = { .len = (unsigned short)len, .filter = prog };
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
     fprintf(stderr, "profiled: PR_SET_NO_NEW_PRIVS: %s\n", strerror(errno));
     free(prog);
@@ -385,6 +397,36 @@ static int install_allow(const unsigned char *set, int n) {
   }
   free(prog);
   return 0;
+}
+
+// Interpret the filter for one (arch, nr) and return the action, or
+// -1 if the program contains an instruction this does not model.
+//
+// Refusing an unmodelled opcode rather than treating it as a no-op is
+// the whole reliability of this: an interpreter that shrugs at what
+// it does not recognise reports ALLOW for a filter it never read.
+static long eval_filter(const struct sock_filter *prog, int len,
+                        unsigned arch, unsigned nr) {
+  unsigned A = 0;
+  for (int pc = 0; pc < len; ) {
+    const struct sock_filter *i = &prog[pc];
+    switch (i->code) {
+    case BPF_LD | BPF_W | BPF_ABS:
+      if (i->k == (unsigned)offsetof(struct seccomp_data, arch)) A = arch;
+      else if (i->k == (unsigned)offsetof(struct seccomp_data, nr)) A = nr;
+      else return -1;                       // some other field: not modelled
+      pc++;
+      break;
+    case BPF_JMP | BPF_JEQ | BPF_K:
+      pc += 1 + (A == i->k ? i->jt : i->jf);
+      break;
+    case BPF_RET | BPF_K:
+      return (long)i->k;
+    default:
+      return -1;
+    }
+  }
+  return -1;                                 // ran off the end
 }
 
 static int apply(const char *path, char **argv) {
@@ -448,11 +490,24 @@ static int check(const char *path) {
   int n = read_profile(path, set);
   if (n < 0) return 2;
 
+  int len = 0;
+  struct sock_filter *prog = build_filter(set, n, &len);
+  if (!prog) return 2;
+
   int denied = 0, permitted = 0, bad = 0;
   for (int i = 0; i < PROBES_N; i++) {
     int nr = PROBES[i].nr;
     int want_kill = !set[nr];
     int got = probe_under(set, n, nr);
+
+    // There was a cross-check here requiring the interpreter's verdict
+    // on this number to match the kernel's. It was deleted because it
+    // cannot fail. The exhaustive pass below requires the interpreter
+    // to agree with the profile for every number, and the comparison
+    // just below requires the kernel to agree with the profile for
+    // this one, so the two agreeing with each other follows. Keeping
+    // it would have been a check that reads well and cannot go red,
+    // which is the thing this whole project is about not doing.
     if (got < 0) {
       printf("  %-13s could not be read\n", PROBES[i].name);
       bad++;
@@ -473,12 +528,69 @@ static int check(const char *path) {
   // report success having tested nothing about denial, which is the
   // half of the claim that matters. It refuses instead.
   if (!denied && !bad) {
+    free(prog);
     fprintf(stderr, "profiled: every probe is permitted by this profile, so "
             "nothing about denial was tested\n");
     return 2;
   }
-  printf("check: %d denied as expected, %d permitted as expected, %d wrong\n",
-         denied, permitted, bad);
+  // ---- exhaustive, over the same bytes the kernel was given
+  //
+  // The ten probes above are the kernel's verdict on ten numbers. The
+  // profile omits a thousand. The rest cannot be probed the same way:
+  // the check confirms a denied call is stopped before it runs, so if
+  // the filter is wrong the call runs, and issuing an arbitrary
+  // syscall under those conditions is the thing not to do. A tracer
+  // cannot rescue it either, because the kernel runs ptrace before
+  // seccomp precisely so a tracer can change what seccomp sees: a
+  // substituted number is the number the filter judges, so the
+  // original is never tested.
+  //
+  // So the rest is covered by interpreting the filter, and the two
+  // halves hold each other up. The interpreter reads the exact bytes
+  // handed to the kernel, and its verdict is required to match the
+  // kernel's on all ten probes. An interpreter that agreed with the
+  // profile but not with the kernel would be checking its own
+  // opinion, which is why that comparison is a failure and not a
+  // note.
+  int wrong_nr = 0, unmodelled = 0;
+  for (int nr = 0; nr < NR_MAX; nr++) {
+    long act = eval_filter(prog, len, AUDIT_ARCH_X86_64, (unsigned)nr);
+    if (act < 0) { unmodelled++; continue; }
+    long want = set[nr] ? SECCOMP_RET_ALLOW : SECCOMP_RET_KILL_PROCESS;
+    if (act != want) {
+      if (wrong_nr < 3)
+        printf("  syscall %d would be %s, the profile says %s\n", nr,
+               act == SECCOMP_RET_ALLOW ? "permitted" : "denied",
+               set[nr] ? "permitted" : "denied");
+      wrong_nr++;
+    }
+  }
+
+  // Another ABI reaches the same kernel through different numbers, so
+  // every one of them has to be killed rather than judged against a
+  // table that does not apply.
+  int wrong_arch = 0;
+  for (int nr = 0; nr < NR_MAX; nr++) {
+    long act = eval_filter(prog, len, AUDIT_ARCH_I386, (unsigned)nr);
+    if (act != SECCOMP_RET_KILL_PROCESS) wrong_arch++;
+  }
+  free(prog);
+
+  if (unmodelled) {
+    printf("  the filter contains %d instruction(s) this check does not "
+           "model, so its verdict is incomplete\n", unmodelled);
+    bad += unmodelled;
+  }
+  if (wrong_nr) { printf("  %d syscall(s) disagree with the profile\n", wrong_nr); bad += wrong_nr; }
+  if (wrong_arch) {
+    printf("  %d syscall(s) would be judged under the wrong ABI instead of "
+           "killed\n", wrong_arch);
+    bad += wrong_arch;
+  }
+
+  printf("check: %d denied as expected, %d permitted as expected, %d wrong; "
+         "%d numbers and a second ABI checked against the installed filter\n",
+         denied, permitted, bad, NR_MAX);
   return bad ? 1 : 0;
 }
 

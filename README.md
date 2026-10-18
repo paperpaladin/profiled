@@ -3,9 +3,10 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
-**Four commits in.** `record`, `apply` and `check` all work: a program
+**Five commits in.** `record`, `apply` and `check` all work: a program
 can be watched, run under a policy built from what it did, and the
-policy can be shown to deny what it omits.
+policy shown to deny what it omits, for all 1024 syscall numbers and
+a second ABI.
 
 ```
 $ profiled record -o echo.p -- /bin/echo hi
@@ -21,7 +22,7 @@ hi
 $ profiled apply echo.p -- /bin/cat /etc/hostname
 Bad system call (core dumped)
 $ profiled check echo.p
-check: 10 denied as expected, 0 permitted as expected, 0 wrong
+check: 10 denied as expected, 0 permitted as expected, 0 wrong; 1024 numbers and a second ABI checked against the installed filter
 ```
 
 ```
@@ -38,7 +39,7 @@ ok    check notices a filter that permits more than the profile
 ok    refuses a profile for another architecture, by name
 ok    two recordings of the same workload are byte-identical
 
-37 passed, 0 failed
+41 passed, 0 failed
 ```
 
 
@@ -137,11 +138,49 @@ the reason is the check itself. It confirms that a denied call is
 stopped *before it runs*; if the filter is wrong, the call runs.
 Issuing an arbitrary syscall in a process whose filter might be
 broken is precisely the thing not to do. So every probe reads a
-number the kernel already knows and changes nothing. The cost is
-that the deny path is demonstrated on ten syscalls and not on all of
-them, and closing that needs the filter read back out of the kernel
-with `PTRACE_SECCOMP_GET_FILTER` and checked against the profile
-number by number. That is not done.
+number the kernel already knows and changes nothing.
+
+The other thousand are covered by interpreting the filter directly,
+over the exact bytes handed to the kernel: there is one builder, and
+`check` runs the interpreter on what `apply` installs. Every number
+must come out `ALLOW` if the profile lists it and `KILL` if it does
+not, and every number under a second ABI must come out `KILL`,
+because another ABI reaches the same kernel through different numbers
+and judging them against a table that does not apply is the bypass
+the arch guard exists to prevent.
+
+An instruction the interpreter cannot model is reported, not
+shrugged at. An interpreter that treats what it cannot read as a
+no-op returns a verdict on a filter it never understood.
+
+### Two routes that do not work
+
+`PTRACE_SECCOMP_GET_FILTER` would read the filter back out of the
+kernel rather than rebuilding it, which is a better oracle. It
+requires `CAP_SYS_ADMIN` and returns `EACCES` to an ordinary user, so
+a check built on it would skip on every machine this runs on.
+
+Probing all 1024 numbers under a tracer that neutralises anything
+dangerous does not work either, and the reason is worth knowing. The
+kernel runs the ptrace syscall-entry stop **before** seccomp,
+deliberately, so that a tracer's changes are what the filter judges.
+Measured here rather than assumed: with the tracer writing -1 over
+`orig_rax`, a call the filter denies survives, and with the write
+removed the same call dies of `SIGSYS`. So a tracer cannot both
+neutralise a syscall and find out what the filter would have done
+with it. The substituted number is the number the filter sees.
+
+### Why the two halves are enough together
+
+The interpreter agrees with the profile for every number. The kernel
+agrees with the profile on ten. Those two facts imply the interpreter
+agrees with the kernel on those ten, which is what ties the exhaustive
+half to the real one.
+
+There was an explicit cross-check asserting exactly that, and it was
+deleted: by the argument above it cannot fail while the other two
+checks run, and a check that reads well and cannot go red is the thing
+this project is about not writing.
 
 A check that happened to probe only permitted syscalls would report
 success having tested nothing about denial, so it refuses instead.
@@ -159,6 +198,12 @@ to notice. The first attempt planted an *extra* permitted syscall and
 was caught by the instruction-count assertion before `check` could be
 wrong at all, which is the assertion working and the test not. It is
 a mis-aimed comparison now, so the count is unchanged.
+
+There are five planted defects in all, one per branch that cannot be
+reached while the program is correct: a filter permitting more than
+the profile, a load from a field the interpreter does not model, an
+opcode outside the three it models, an architecture guard that does
+not guard, and an interpreter that misreads the syscall number.
 
 ## A profile is not a property of a program
 
@@ -204,6 +249,14 @@ makes a profile reviewable in a diff.
 Two mutations survive and both are genuinely equivalent rather than
 untested:
 
+- Counting unmodelled instructions towards the exit status. Every
+  filter that reaches that branch also trips the probe check or the
+  arch check, so the counter never decides anything. It is kept
+  because the message it accompanies says the verdict is
+  *incomplete*, and exiting 0 on an incomplete verdict would be this
+  project's cardinal sin.
+- Returning an error when the interpreter runs off the end of a
+  program. `build_filter` always ends in a `RET`.
 - Requiring `SIGSYS` specifically rather than any signal in `check`.
   The only way a probe child dies here is `SIGSYS`, so the
   specificity is defensive.
@@ -227,11 +280,10 @@ requiring the gate to see it.
 
 Everything else. In the order it is planned:
 
-- Exhaustive tightness. `check` probes ten syscalls, not all 1024.
-  Reading the filter back with `PTRACE_SECCOMP_GET_FILTER` and
-  checking it against the profile number by number would close it,
-  and the program bytes would come from the kernel rather than from
-  our own array.
+- The exhaustive half interprets a filter this program built rather
+  than one read back from the kernel. The kernel's own copy needs
+  `CAP_SYS_ADMIN` to retrieve, so what ties the two together is the
+  ten concrete probes and the argument above, not a direct read.
 - Filtering on arguments. The policy is syscall numbers only, so
   `openat` is permitted or not, never permitted for one path.
 - `SECCOMP_RET_ERRNO`. A denied call kills the process and there is

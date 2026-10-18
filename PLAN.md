@@ -126,12 +126,36 @@ Ranked by how little we control them.
            at planting one was caught by the instruction-count
            assertion before check could be wrong, so it is now a
            mis-aimed comparison that keeps the count.
-- [ ] 06b exhaustive tightness via PTRACE_SECCOMP_GET_FILTER
+- [x] 06b exhaustive tightness, though not via PTRACE_SECCOMP_GET_FILTER
       why: check probes ten syscalls and the profile omits a thousand.
            Reading the installed filter back out of the kernel and
            evaluating it for every number closes that without issuing
            a single dangerous call, and the bytes come from the kernel
            rather than from our own array.
+      done: not that way. PTRACE_SECCOMP_GET_FILTER needs
+           CAP_SYS_ADMIN and returns EACCES to an ordinary user, so a
+           check built on it would skip on every machine this runs
+           on.
+           Probing all 1024 under a tracer that neutralises the
+           dangerous ones does not work either, and the reason is the
+           find of the item: the kernel runs the ptrace syscall-entry
+           stop BEFORE seccomp, deliberately, so the filter judges
+           whatever the tracer left in orig_rax. Measured, not
+           assumed: with the tracer writing -1 a denied call survives,
+           and with the write removed the same call dies of SIGSYS.
+           What is done instead is interpreting the filter over the
+           exact bytes handed to the kernel, for all 1024 numbers and
+           a second ABI, with one builder so the interpreted program
+           and the installed program cannot drift apart. An
+           unmodelled instruction is reported rather than shrugged
+           at.
+           An explicit cross-check between the interpreter and the
+           kernel was written and then deleted: the exhaustive pass
+           requires the interpreter to match the profile everywhere
+           and the probes require the kernel to match it on ten, so
+           their agreeing follows and the assertion could not fail.
+           Five planted defects, one per branch unreachable while the
+           program is correct.
 - [ ] 07 the recorder's own syscalls must not leak into the profile
       why: ptrace sees the tracee, but exec, mmap and the dynamic
            loader run before main and belong to the program. The
