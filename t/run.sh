@@ -82,6 +82,10 @@ case "$out" in
 	*) nok "the permitted syscall actually ran" "got [$out]" ;;
 esac
 
+# Every record call is wrapped in a timeout. A tracer that loses a
+# stop waits forever, and the first version of the signal handling did
+# exactly that: a suite that hangs reports nothing at all, which is
+# worse than one that fails.
 # ------------------------------------------------------------- record
 # The syscall set of one run, and then the same run watched by strace.
 # A recorder checked against itself proves nothing: this is the first
@@ -99,7 +103,7 @@ trap 'rm -rf "$TMP"' EXIT INT TERM
 # The recording must not land on the program's stdout. Recording
 # /bin/echo once produced a profile with "hi" in it, because the traced
 # program inherits these streams.
-"$PWD/profiled" record -o "$TMP/p" -- /bin/echo marker > "$TMP/out" 2>&1
+timeout 60 "$PWD/profiled" record -o "$TMP/p" -- /bin/echo marker > "$TMP/out" 2>&1
 eq "the program's own output does not reach the profile" \
    "marker" "$(cat "$TMP/out")"
 # A header naming the format and the ABI, then nothing but numbers.
@@ -191,6 +195,46 @@ else
 	echo "SKIP  strace is not installed, so the recorder has no second observer"
 fi
 
+# ------------------------------------------------- where the program starts
+# The boundary between the recorder's syscalls and the program's, and
+# it is not where it first looks.
+#
+# execve BELONGS to the program and must be in the profile: `apply`
+# installs the filter and then execs, so a profile without it kills
+# the program before it has run an instruction. Everything the child
+# does before that (ptrace(TRACEME), and the raise(SIGSTOP) that lets
+# the parent set its options) must not be, and is not, because the
+# parent's first waitpid returns only after that stop. That ordering
+# is by construction rather than by luck, which is why it is not a
+# flaky test.
+#
+# The tracer's own calls must be absent too. They would be, since the
+# tracer is a different process, but a recorder that read the wrong
+# pid would put them there and every id in the profile would still
+# look plausible.
+timeout 60 "$PWD/profiled" record -o "$TMP/b.p" -- /bin/true > /dev/null 2>&1
+if tail -n +3 "$TMP/b.p" | grep -qx 59; then
+	ok "execve is in the profile, because apply has to exec under it"
+else
+	nok "execve is in the profile" "59 is absent, so apply would die at exec"
+fi
+leaked=
+for pair in "101 ptrace" "61 wait4" "62 kill" "57 fork"; do
+	n=${pair%% *}
+	tail -n +3 "$TMP/b.p" | grep -qx "$n" && leaked="$leaked ${pair#* }"
+done
+if [ -z "$leaked" ]; then
+	ok "no syscall only the recorder makes is in the profile"
+else
+	nok "no syscall only the recorder makes is in the profile" "found:$leaked"
+fi
+
+# And the whole thing has to survive the round trip it exists for: the
+# profile recorded from /bin/true must let /bin/true run.
+/bin/true; want=$?
+"$PWD/profiled" apply "$TMP/b.p" -- /bin/true; got=$?
+eq "the recorded program runs under its own profile" "$want" "$got"
+
 # -------------------------------------------------------------- apply
 # The first half of the claim: under its own profile the program must
 # behave identically. Not "exits 0": stdout, stderr and exit status
@@ -205,7 +249,7 @@ for w in "/bin/echo hello" "/bin/cat /etc/hostname" "/usr/bin/head -2 /etc/hosts
 	# uses copy_file_range to a regular file and a read/write loop to
 	# a pipe, so recording with stdout elsewhere produces a profile
 	# that kills it here. See the case below, which demonstrates it.
-	if ! "$PWD/profiled" record -o "$TMP/p" -- "$@" \
+	if ! timeout 60 "$PWD/profiled" record -o "$TMP/p" -- "$@" \
 	     > "$TMP/rec.out" 2> "$TMP/rec.err"; then
 		nok "record [$w]" "$(head -1 "$TMP/rec.err")"
 		continue
@@ -228,7 +272,7 @@ done
 # not the tightness check, which comes next and is sharper, but it is
 # the cheap version of it: if this passed by allowing everything, the
 # whole project would be decoration.
-"$PWD/profiled" record -o "$TMP/echo.p" -- /bin/echo hi > /dev/null 2>&1
+timeout 60 "$PWD/profiled" record -o "$TMP/echo.p" -- /bin/echo hi > /dev/null 2>&1
 got=$(./t/waitstat -q "$PWD/profiled" apply "$TMP/echo.p" -- /bin/cat /etc/hostname 2>/dev/null)
 eq "another program under that profile is killed" "signal 31" "$got"
 
@@ -241,7 +285,7 @@ eq "another program under that profile is killed" "signal 31" "$got"
 #
 # This is demonstrated rather than worked around, because it is the
 # thing a user of this program most needs to know.
-"$PWD/profiled" record -o "$TMP/pipe.p" -- /bin/cat /etc/hostname \
+timeout 60 "$PWD/profiled" record -o "$TMP/pipe.p" -- /bin/cat /etc/hostname \
 	> /dev/null 2>&1
 got=$(./t/waitstat "$PWD/profiled" apply "$TMP/pipe.p" -- \
       /bin/cat /etc/hostname > "$TMP/cfr.out" 2>/dev/null)
@@ -420,8 +464,8 @@ refuses "a profile permitting nothing" \
 
 # Two recordings of the same workload must produce the same bytes, or
 # a profile cannot be reviewed in a diff.
-"$PWD/profiled" record -o "$TMP/a.p" -- /bin/echo hi > /dev/null 2>&1
-"$PWD/profiled" record -o "$TMP/b.p" -- /bin/echo hi > /dev/null 2>&1
+timeout 60 "$PWD/profiled" record -o "$TMP/a.p" -- /bin/echo hi > /dev/null 2>&1
+timeout 60 "$PWD/profiled" record -o "$TMP/b.p" -- /bin/echo hi > /dev/null 2>&1
 if cmp -s "$TMP/a.p" "$TMP/b.p"; then
 	ok "two recordings of the same workload are byte-identical"
 else

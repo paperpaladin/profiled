@@ -3,7 +3,7 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
-**Five commits in.** `record`, `apply` and `check` all work: a program
+**Six commits in.** `record`, `apply` and `check` all work: a program
 can be watched, run under a policy built from what it did, and the
 policy shown to deny what it omits, for all 1024 syscall numbers and
 a second ABI.
@@ -37,9 +37,11 @@ ok    a profile recorded with stdout elsewhere kills the same command
 ok    check: 10 denied as expected, 0 permitted as expected, 0 wrong
 ok    check notices a filter that permits more than the profile
 ok    refuses a profile for another architecture, by name
+ok    execve is in the profile, because apply has to exec under it
+ok    no syscall only the recorder makes is in the profile
 ok    two recordings of the same workload are byte-identical
 
-41 passed, 0 failed
+44 passed, 0 failed
 ```
 
 
@@ -204,6 +206,21 @@ reached while the program is correct: a filter permitting more than
 the profile, a load from a field the interpreter does not model, an
 opcode outside the three it models, an architecture guard that does
 not guard, and an interpreter that misreads the syscall number.
+
+## Where the program starts
+
+`execve` belongs to the program and is in the profile. That is worth
+saying because it looks like the tracer's: `apply` installs the
+filter and then execs, so a profile without `execve` kills the
+program before it has run an instruction.
+
+Everything the child does before that, `ptrace(TRACEME)` and the
+`raise(SIGSTOP)` that lets the parent set its options, is outside the
+profile, and by construction rather than by luck: the parent's first
+`waitpid` returns only after that stop. The tracer's own calls are
+outside too, which they would be anyway, but a recorder reading the
+wrong pid would put them in and every id would still look plausible.
+Both are cases, and both mutations are caught.
 
 ## A profile is not a property of a program
 

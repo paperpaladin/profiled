@@ -156,11 +156,27 @@ Ranked by how little we control them.
            their agreeing follows and the assertion could not fail.
            Five planted defects, one per branch unreachable while the
            program is correct.
-- [ ] 07 the recorder's own syscalls must not leak into the profile
+- [x] 07 the recorder's own syscalls must not leak into the profile
       why: ptrace sees the tracee, but exec, mmap and the dynamic
            loader run before main and belong to the program. The
            boundary has to be decided and stated, because getting it
            wrong produces a profile that works only under ptrace.
+      done: nothing leaks, and the boundary is not where it first
+           looks. execve BELONGS to the program and has to be in the
+           profile, because apply installs the filter and then execs,
+           so a profile without it kills the program before it runs
+           an instruction. Everything the child does before that,
+           ptrace(TRACEME) and the raise(SIGSTOP) that lets the
+           parent set its options, is outside, and by construction
+           rather than by luck: the parent's first waitpid returns
+           only after that stop.
+           Both directions are cases now, and both mutations are
+           caught: reading the wrong pid, and dropping the initial
+           wait.
+           Every record call in the suite is wrapped in a timeout.
+           The dropped-wait mutation hangs, and the signal-handling
+           bug in commit 2 hung the same way. A suite that hangs
+           reports nothing, which is worse than one that fails.
 - [ ] 08 a second workload with a different shape
       why: one program is one data point, and a profile derived from
            a short-lived process will not exercise the paths a
