@@ -3,7 +3,7 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
-**Seven commits in.** `record`, `apply` and `check` all work: a program
+**Eight commits in.** `record`, `apply` and `check` all work: a program
 can be watched, run under a policy built from what it did, and the
 policy shown to deny what it omits, for all 1024 syscall numbers and
 a second ABI.
@@ -41,7 +41,7 @@ ok    execve is in the profile, because apply has to exec under it
 ok    no syscall only the recorder makes is in the profile
 ok    two recordings of the same workload are byte-identical
 
-48 passed, 0 failed
+56 passed, 0 failed
 ```
 
 
@@ -186,6 +186,26 @@ this project is about not writing.
 
 A check that happened to probe only permitted syscalls would report
 success having tested nothing about denial, so it refuses instead.
+
+### A case that had never run
+
+The `copy_file_range` case below printed `SKIP` every run from the
+day it was written, and nobody noticed, because a skip is not a
+failure. An outer shell redirect was capturing `waitstat`'s verdict
+along with the program's output, the empty verdict took the "cat no
+longer varies" branch, and the case reported that it had nothing to
+say rather than that it was broken.
+
+`waitstat` takes `-o FILE` now, so the child's output and the verdict
+do not share a stream, and an empty verdict is a failure rather than
+a skip. A skip has to mean "the oracle is not here", never "the
+harness did not work".
+
+The workload loop had the same shape of bug: written as a pipe into
+`while read`, it ran in a subshell, so every pass and fail it counted
+was discarded when the subshell exited. It is a here-document now,
+and planting a broken filter turns 23 cases red where it would have
+turned none.
 
 ### What this one got wrong
 

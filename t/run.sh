@@ -240,7 +240,34 @@ eq "the recorded program runs under its own profile" "$want" "$got"
 # behave identically. Not "exits 0": stdout, stderr and exit status
 # compared byte for byte against the unconfined run, because a sandbox
 # that quietly breaks the workload is not a tighter sandbox.
-for w in "/bin/echo hello" "/bin/cat /etc/hostname" "/usr/bin/head -2 /etc/hosts"; do
+# The first three are small and similar on purpose: they are where a
+# mistake is easiest to read. The last two are the point of item 08.
+# python3 makes 34 syscalls to echo's 20, with dynamic loading, a pile
+# of stat and openat, and signal setup that none of the others reach;
+# sort allocates and uses a temporary. A profile derived from a
+# four-syscall program proves very little about one that does real
+# work.
+#
+# Both are skipped rather than failed when absent, because they are
+# two workloads among five and the suite still means something
+# without them.
+WORKLOADS="/bin/echo hello
+/bin/cat /etc/hostname
+/usr/bin/head -2 /etc/hosts"
+for extra in "/usr/bin/python3 -c pass" "/usr/bin/sort /etc/hosts"; do
+	if [ -x "${extra%% *}" ]; then
+		WORKLOADS="$WORKLOADS
+$extra"
+	else
+		printf 'SKIP  %s is not installed\n' "${extra%% *}"
+	fi
+done
+
+# Fed by a here-document and not a pipe: a pipe runs the loop in a
+# subshell and every pass and fail it counts is discarded when the
+# subshell exits. The suite would report fewer tests than it ran and
+# a failure in here would not be a failure at all.
+while read -r w; do
 	# shellcheck disable=SC2086
 	set -- $w
 	"$@" > "$TMP/free.out" 2> "$TMP/free.err"; free_st=$?
@@ -266,7 +293,21 @@ for w in "/bin/echo hello" "/bin/cat /etc/hostname" "/usr/bin/head -2 /etc/hosts
 	else
 		ok "[$w] runs identically under its own profile"
 	fi
-done
+
+	# And the profile it produced has to be tight, not just
+	# sufficient. A bigger workload permits more syscalls, which is
+	# exactly when a filter builder with a wrong jump offset starts
+	# to matter.
+	out=$("$PWD/profiled" check "$TMP/p" 2>&1)
+	if [ $? -eq 0 ] && printf '%s' "$out" | grep -q '0 wrong'; then
+		ok "[$w] its profile is tight"
+	else
+		nok "[$w] its profile is tight"
+		printf '%s\n' "$out" | head -4 | sed 's/^/        /'
+	fi
+done <<WORKLOAD_LIST
+$WORKLOADS
+WORKLOAD_LIST
 
 # A profile from one program applied to another has to kill it. This is
 # not the tightness check, which comes next and is sharper, but it is
@@ -287,14 +328,25 @@ eq "another program under that profile is killed" "signal 31" "$got"
 # thing a user of this program most needs to know.
 timeout 60 "$PWD/profiled" record -o "$TMP/pipe.p" -- /bin/cat /etc/hostname \
 	> /dev/null 2>&1
-got=$(./t/waitstat "$PWD/profiled" apply "$TMP/pipe.p" -- \
-      /bin/cat /etc/hostname > "$TMP/cfr.out" 2>/dev/null)
+# -o and not a shell redirect: cat has to be writing to a REGULAR
+# file for copy_file_range to be the path it takes, and an outer
+# redirect would capture waitstat's verdict along with it.
+got=$(./t/waitstat -o "$TMP/cfr.out" "$PWD/profiled" apply "$TMP/pipe.p" -- \
+      /bin/cat /etc/hostname 2>/dev/null)
 if [ "$got" = "signal 31" ]; then
 	ok "a profile recorded with stdout elsewhere kills the same command"
+elif [ -z "$got" ]; then
+	# An empty verdict is this harness being wrong, not cat having
+	# changed, and it must not take the skip branch. It did, for as
+	# long as this case existed, because an outer redirect was
+	# swallowing the verdict: the case printed SKIP every run and a
+	# SKIP is not a failure, so nothing said so.
+	nok "a profile recorded with stdout elsewhere kills the same command" \
+	    "waitstat said nothing, so this case measured nothing"
 else
-	# Not a failure of the program: it means this cat no longer takes
-	# a different path, and the warning in the README needs a new
-	# example rather than deleting.
+	# A real skip: cat no longer takes a different path by output
+	# type, and the warning in the README needs a new example rather
+	# than deleting.
 	printf 'SKIP  cat no longer varies by output type here (got %s)\n' "$got"
 fi
 

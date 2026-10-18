@@ -177,7 +177,7 @@ Ranked by how little we control them.
            The dropped-wait mutation hangs, and the signal-handling
            bug in commit 2 hung the same way. A suite that hangs
            reports nothing, which is worse than one that fails.
-- [ ] 08 a second workload with a different shape
+- [x] 08 a second workload with a different shape
       why: one program is one data point, and a profile derived from
            a short-lived process will not exercise the paths a
            long-lived one does.
