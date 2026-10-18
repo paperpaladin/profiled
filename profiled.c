@@ -3,8 +3,9 @@
 // the policy, and that a syscall outside it is killed by the kernel.
 //
 // So far: the filter builder and the probe subcommand the suite drives
-// to show that an installed filter actually bites, and `record`, which
-// is the input to everything else.
+// to show that an installed filter actually bites, `record`, the
+// profile file, and `apply`. `check` is next and is the half of the
+// claim that is easy to fake.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
@@ -70,8 +71,6 @@ static int install_deny_one(int nr) {
   return 0;
 }
 
-// ---------------------------------------------------------------- record
-
 // x86-64 is at 460-odd syscalls and the table only grows, so 1024 has
 // room without being a guess that quietly truncates: a number outside
 // it is reported rather than dropped. A profile missing one syscall is
@@ -80,6 +79,118 @@ static int install_deny_one(int nr) {
 #define NR_MAX 1024
 #endif
 static unsigned char seen[NR_MAX];
+
+// ------------------------------------------------------- the profile
+
+// Version 1. Text, one syscall number per line, sorted, with the ABI
+// named at the top.
+//
+// The ABI line is not decoration. A syscall number is an index into
+// one ABI's table, so the same file means something different on
+// another machine, and the difference is a policy that permits the
+// wrong calls rather than a file that fails to parse. It is checked on
+// load and the load fails if it does not match.
+#define PROFILE_MAGIC "profiled 1"
+
+static int write_profile(const char *path, const unsigned char *set) {
+  FILE *f = fopen(path, "w");
+  if (!f) { fprintf(stderr, "profiled: %s: %s\n", path, strerror(errno)); return 2; }
+  fprintf(f, "%s\n", PROFILE_MAGIC);
+  fprintf(f, "arch 0x%x\n", (unsigned)AUDIT_ARCH_X86_64);
+  for (int i = 0; i < NR_MAX; i++)
+    if (set[i]) fprintf(f, "%d\n", i);
+  if (fclose(f) != 0) {
+    fprintf(stderr, "profiled: %s: %s\n", path, strerror(errno));
+    return 2;
+  }
+  return 0;
+}
+
+// Fills `set` and returns the count, or -1 with a message.
+//
+// Every line is either understood or refused. A profile reader that
+// skips what it does not recognise turns a typo into a policy that
+// permits less than the file says, and the program dies somewhere else
+// entirely with no hint that the file was the problem.
+static int read_profile(const char *path, unsigned char *set) {
+  FILE *f = fopen(path, "r");
+  if (!f) { fprintf(stderr, "profiled: %s: %s\n", path, strerror(errno)); return -1; }
+
+  char line[256];
+  int lineno = 0, n = 0, have_magic = 0, have_arch = 0, last = -1;
+  while (fgets(line, sizeof line, f)) {
+    lineno++;
+    size_t len = strlen(line);
+    if (len && line[len - 1] == '\n') line[--len] = 0;
+    else if (!feof(f)) {
+      fprintf(stderr, "profiled: %s:%d: line is longer than %zu bytes\n",
+              path, lineno, sizeof line - 1);
+      fclose(f); return -1;
+    }
+    if (!len) continue;
+
+    if (lineno == 1) {
+      if (strcmp(line, PROFILE_MAGIC)) {
+        fprintf(stderr, "profiled: %s: not a version 1 profile "
+                "(first line is \"%s\")\n", path, line);
+        fclose(f); return -1;
+      }
+      have_magic = 1;
+      continue;
+    }
+    if (!strncmp(line, "arch ", 5)) {
+      unsigned long a = strtoul(line + 5, NULL, 0);
+      if (a != (unsigned long)AUDIT_ARCH_X86_64) {
+        fprintf(stderr, "profiled: %s: profile is for arch 0x%lx, this is "
+                "0x%x. Syscall numbers mean different things on the two.\n",
+                path, a, (unsigned)AUDIT_ARCH_X86_64);
+        fclose(f); return -1;
+      }
+      have_arch = 1;
+      continue;
+    }
+
+    char *end;
+    long v = strtol(line, &end, 10);
+    if (*end || end == line || v < 0 || v >= NR_MAX) {
+      fprintf(stderr, "profiled: %s:%d: cannot read \"%s\" as a syscall "
+              "number\n", path, lineno, line);
+      fclose(f); return -1;
+    }
+    // Sorted and distinct, enforced rather than assumed. An unsorted
+    // or duplicated file still builds a working filter, so this is
+    // about the file being canonical: two recordings of the same
+    // workload have to produce the same bytes.
+    if ((int)v <= last) {
+      fprintf(stderr, "profiled: %s:%d: %ld is out of order or repeated\n",
+              path, lineno, v);
+      fclose(f); return -1;
+    }
+    last = (int)v;
+    set[v] = 1;
+    n++;
+  }
+  fclose(f);
+
+  if (!have_magic) {
+    fprintf(stderr, "profiled: %s: empty, so it is not a profile\n", path);
+    return -1;
+  }
+  if (!have_arch) {
+    fprintf(stderr, "profiled: %s: no arch line, so the syscall numbers "
+            "cannot be trusted\n", path);
+    return -1;
+  }
+  if (!n) {
+    fprintf(stderr, "profiled: %s: permits no syscalls at all, which would "
+            "kill the program at its first instruction\n", path);
+    return -1;
+  }
+  return n;
+}
+
+// ---------------------------------------------------------------- record
+
 
 // Syscalls that make another process. ptrace follows only what it is
 // told to follow, and without PTRACE_O_TRACEFORK a child runs
@@ -193,15 +304,97 @@ static int record(const char *outpath, char **argv) {
   // so a profile written to stdout is interleaved with whatever the
   // program printed: recording /bin/echo produced a profile with "hi"
   // in it. The file is the only output.
-  FILE *f = fopen(outpath, "w");
-  if (!f) { fprintf(stderr, "profiled: %s: %s\n", outpath, strerror(errno)); return 2; }
-  for (int i = 0; i < NR_MAX; i++)
-    if (seen[i]) fprintf(f, "%d\n", i);
-  if (fclose(f) != 0) {
-    fprintf(stderr, "profiled: %s: %s\n", outpath, strerror(errno));
-    return 2;
+  // Never stdout. The traced program inherits this process's streams,
+  // so a profile written to stdout is interleaved with whatever the
+  // program printed: recording /bin/echo produced a profile with "hi"
+  // in it. The file is the only output.
+  return write_profile(outpath, seen);
+}
+
+// ---------------------------------------------------------------- apply
+
+// Allow the listed syscalls, kill on anything else. The architecture
+// check is the same one the probe filter uses and for the same reason.
+static int install_allow(const unsigned char *set, int n) {
+  // Four for the preamble (load arch, compare, kill, load nr), one
+  // comparison per permitted syscall, then kill and allow. The first
+  // version of this said "2 per syscall", counting a load that happens
+  // once, so every jump offset was computed against a length that was
+  // too large and the kernel returned EINVAL. The assertion below is
+  // why that is a one-time mistake.
+  int len = 4 + n + 2;
+  struct sock_filter *prog = calloc((size_t)len, sizeof *prog);
+  if (!prog) { fputs("profiled: out of memory\n", stderr); return -1; }
+
+  int k = 0;
+  struct sock_filter ld_arch =
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+               (unsigned)offsetof(struct seccomp_data, arch));
+  struct sock_filter jeq_arch =
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0);
+  struct sock_filter kill =
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+  struct sock_filter ld_nr =
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+               (unsigned)offsetof(struct seccomp_data, nr));
+  struct sock_filter allow = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+
+  prog[k++] = ld_arch;
+  prog[k++] = jeq_arch;
+  prog[k++] = kill;
+  prog[k++] = ld_nr;
+  for (int i = 0; i < NR_MAX; i++) {
+    if (!set[i]) continue;
+    // Jump over the remaining comparisons straight to the allow, which
+    // is the last instruction. Computed from where we are rather than
+    // counted up front, so adding an instruction above cannot silently
+    // make every jump land one short.
+    int here = k;
+    int to_allow = (len - 1) - (here + 1);
+    struct sock_filter j =
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)i, (unsigned char)to_allow, 0);
+    if (to_allow > 255) {
+      fputs("profiled: too many syscalls for a flat filter\n", stderr);
+      free(prog);
+      return -1;
+    }
+    prog[k++] = j;
   }
+  prog[k++] = kill;
+  prog[k++] = allow;
+
+  // The jump offsets above are computed from `len`, so a `len` that
+  // does not match what was emitted sends every jump somewhere wrong.
+  // The kernel says EINVAL, which does not name the cause.
+  if (k != len) {
+    fprintf(stderr, "profiled: filter is %d instructions, expected %d\n", k, len);
+    free(prog);
+    return -1;
+  }
+
+  struct sock_fprog fprog = { .len = (unsigned short)k, .filter = prog };
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+    fprintf(stderr, "profiled: PR_SET_NO_NEW_PRIVS: %s\n", strerror(errno));
+    free(prog);
+    return -1;
+  }
+  if (sys_seccomp(SECCOMP_SET_MODE_FILTER, 0, &fprog) < 0) {
+    fprintf(stderr, "profiled: seccomp: %s\n", strerror(errno));
+    free(prog);
+    return -1;
+  }
+  free(prog);
   return 0;
+}
+
+static int apply(const char *path, char **argv) {
+  static unsigned char set[NR_MAX];
+  int n = read_profile(path, set);
+  if (n < 0) return 2;
+  if (install_allow(set, n) < 0) return 2;
+  execvp(argv[0], argv);
+  fprintf(stderr, "profiled: %s: %s\n", argv[0], strerror(errno));
+  return 127;
 }
 
 static void usage(void) {
@@ -210,7 +403,9 @@ static void usage(void) {
         "  Exits 0 if the call returned. The kernel decides the other case.\n"
         "usage: profiled record -o FILE -- CMD [ARG...]\n"
         "  writes the syscall numbers CMD made to FILE, one per line,\n"
-        "  sorted. Never to stdout: the traced program has that one.\n",
+        "  sorted. Never to stdout: the traced program has that one.\n"
+        "usage: profiled apply FILE -- CMD [ARG...]\n"
+        "  installs FILE as a seccomp policy, then runs CMD under it.\n",
         stderr);
 }
 
@@ -236,6 +431,12 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[i], "--")) i++;
     if (i >= argc) { usage(); return 2; }
     return record(argv[3], argv + i);
+  }
+  if (argc >= 4 && !strcmp(argv[1], "apply")) {
+    int i = 3;
+    if (!strcmp(argv[i], "--")) i++;
+    if (i >= argc) { usage(); return 2; }
+    return apply(argv[2], argv + i);
   }
   usage();
   return 2;

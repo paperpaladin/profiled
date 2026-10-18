@@ -3,24 +3,41 @@
 Watch a program run, derive the smallest seccomp-bpf policy that still
 lets it run, install that policy, and prove both halves of the claim.
 
-**Two commits in.** There is a seccomp filter the kernel has been seen
-to enforce, and a recorder that watches a program run and writes down
-the syscalls it made. There is no profile format, no `apply` and no
-`check`.
+**Three commits in.** `record` and `apply` both work: a program can be
+watched, and then run under a policy built from what it did. `check`,
+the half that proves the policy is tight rather than merely
+sufficient, is not written.
+
+```
+$ profiled record -o echo.p -- /bin/echo hi
+$ cat echo.p
+profiled 1
+arch 0xc000003e
+0
+1
+3
+...
+$ profiled apply echo.p -- /bin/echo hi
+hi
+$ profiled apply echo.p -- /bin/cat /etc/hostname
+Bad system call (core dumped)
+```
 
 ```
 $ make test
 ...
 ok    a denied syscall is killed by the kernel, SIGSYS
-ok    a permitted syscall returns, under the same filter
-ok    a syscall outside the table is reported, not dropped
-ok    a forking program is reported as incomplete, by name
-ok    a program waiting on a child does not hang (exit 1)
-ok    strace agrees on [/bin/true]: 17 syscalls, both observers agree
 ok    strace agrees on [/bin/cat /etc/hostname]: 20 syscalls, both observers agree
+ok    [/bin/echo hello] runs identically under its own profile
+ok    [/bin/cat /etc/hostname] runs identically under its own profile
+ok    another program under that profile is killed
+ok    a profile recorded with stdout elsewhere kills the same command
+ok    refuses a profile for another architecture, by name
+ok    two recordings of the same workload are byte-identical
 
-17 passed, 0 failed
+33 passed, 0 failed
 ```
+
 
 
 ## The oracle is the kernel
@@ -101,6 +118,45 @@ The two fixes are a pair, and the suite shows it: removing
 `event == 0` guard on its own is an equivalent mutant as long as
 `TRACEEXEC` stays set.
 
+## A profile is not a property of a program
+
+It is a property of the program **and the environment it ran in**, and
+the sharpest demonstration of that is also the least obvious.
+
+`cat` copies to a regular file with `copy_file_range`, and to a pipe
+with a `read`/`write` loop. So `cat /etc/hostname` makes a different
+set of syscalls depending on where stdout points, and a profile
+recorded with output going to `/dev/null` kills the identical command
+line when its output goes to a file. Two syscalls separate them:
+`copy_file_range` and the `uname` that decides whether to try it.
+
+This is a test rather than a warning in prose. It records one way,
+applies the other, and requires the kill. If a future `cat` stops
+varying, the case says SKIP and asks for a new example rather than
+being deleted, because the hazard will not have gone away.
+
+It is also what the suite got wrong first. The sufficiency check
+recorded with stdout inherited and applied with stdout to a file, and
+`cat` died under what looked like its own profile.
+
+## Reading a profile strictly
+
+Nine refusals, each with the real file and one thing changed: not a
+profile, another architecture, no `arch` line, out of order, a
+repeated number, a line that is not a number, a number out of range,
+empty, and one that permits nothing at all.
+
+A reader that skipped what it did not recognise would turn a typo into
+a policy permitting less than the file says, and the program would
+then die somewhere else with no hint that the file was the problem.
+The `arch` line matters most: a syscall number indexes one ABI's
+table, so the same file is a different policy on another machine, and
+the failure is permitting the wrong calls rather than failing to
+parse.
+
+Two recordings of the same workload are byte-identical, which is what
+makes a profile reviewable in a diff.
+
 ## Survivors, written down
 
 Two mutations survive and both are genuinely equivalent rather than
@@ -124,8 +180,15 @@ requiring the gate to see it.
 
 Everything else. In the order it is planned:
 
-- The profile file, `apply`, and `check`. `record` writes a sorted
-  list of numbers and nothing reads it yet.
+- `check`, which is the half of the claim that is easy to fake.
+  `apply` runs the program and `another program under that profile is
+  killed` is the cheap version of tightness; issuing a specific
+  omitted syscall and requiring SIGSYS is the real one.
+- Filtering on arguments. The policy is syscall numbers only, so
+  `openat` is permitted or not, never permitted for one path.
+- `SECCOMP_RET_ERRNO`. A denied call kills the process and there is
+  no option to fail it instead, which is a different policy with
+  different failure modes.
 - **Child processes.** The recorder does not follow them, so a
   program that forks gets a profile covering the parent only. It
   refuses rather than writing a profile that would kill the program
